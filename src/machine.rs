@@ -1,5 +1,6 @@
 use std::{
-    os::unix::process::ExitStatusExt,
+    fs::Permissions,
+    os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::Output,
     sync::{
@@ -9,11 +10,14 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use nanoid::nanoid;
+use russh_sftp::client::fs::{Metadata, ReadDir};
 use serde::{Deserialize, Serialize};
+use shell_escape::unix::escape;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
+use walkdir::WalkDir;
 
 use crate::{
     image::Image,
@@ -86,6 +90,7 @@ impl Default for MachineConfig {
     }
 }
 
+// Core methods for Machine
 impl Machine {
     /// Create a new Machine instance
     pub async fn new(image: &Image, config: &MachineConfig) -> Result<Self> {
@@ -114,10 +119,10 @@ impl Machine {
         );
         let output = qemu_img_command.output().await?;
         if !output.status.success() {
-            return Err(anyhow::anyhow!(
+            bail!(
                 "Failed to create overlay image: {}",
                 String::from_utf8_lossy(&output.stderr)
-            ));
+            );
         }
         let overlay_image = run_dir.join("overlay.img");
 
@@ -160,10 +165,10 @@ impl Machine {
         );
         let output = xorriso_command.output().await?;
         if !output.status.success() {
-            return Err(anyhow::anyhow!(
+            bail!(
                 "Failed to create seed ISO: {}",
                 String::from_utf8_lossy(&output.stderr)
-            ));
+            );
         }
 
         let machine_image = MachineImage {
@@ -203,17 +208,17 @@ impl Machine {
             );
             let output = qemu_img_command.output().await?;
             if !output.status.success() {
-                return Err(anyhow::anyhow!(
+                bail!(
                     "Failed to resize image: {}",
                     String::from_utf8_lossy(&output.stderr)
-                ));
+                );
             }
         }
 
         if self.ssh_cancel_token.is_none() {
             self.ssh_cancel_token = Some(CancellationToken::new());
         } else {
-            return Err(anyhow::anyhow!("Machine already initialized"));
+            bail!("Machine already initialized");
         }
 
         self.launch(true).await?;
@@ -228,7 +233,7 @@ impl Machine {
         if self.ssh_cancel_token.is_none() {
             self.ssh_cancel_token = Some(CancellationToken::new());
         } else {
-            return Err(anyhow::anyhow!("Machine already spawned"));
+            bail!("Machine already spawned");
         }
 
         self.launch(false).await?;
@@ -237,8 +242,9 @@ impl Machine {
     }
 
     /// Execute a command on the machine and return the output
-    pub async fn exec(&mut self, cmd: &str) -> Result<Output> {
-        info!("🧬 Executing command `{}` on VM-{}", cmd, self.id);
+    pub async fn exec<S: AsRef<str>>(&mut self, cmd: S) -> Result<Output> {
+        let cmd_ref = cmd.as_ref();
+        info!("🧬 Executing command `{}` on VM-{}", cmd_ref, self.id);
         if let Some(ssh) = self.ssh.as_mut() {
             let cancel_token = self
                 .ssh_cancel_token
@@ -246,7 +252,7 @@ impl Machine {
                 .expect("Machine not initialized or spawned")
                 .clone();
 
-            let (exit_code, stdout, stderr) = ssh.call_with_output(cmd, cancel_token).await?;
+            let (exit_code, stdout, stderr) = ssh.call_with_output(cmd_ref, cancel_token).await?;
 
             Ok(Output {
                 status: std::process::ExitStatus::from_raw(exit_code as i32),
@@ -325,13 +331,226 @@ impl Machine {
         }
     }
 
+    /// Upload file or directory to the machine
+    pub async fn upload<P: AsRef<Path>, Q: AsRef<Path>>(
+        &mut self,
+        local_path: P,
+        remote_path: Q,
+    ) -> Result<()> {
+        let local_path = local_path.as_ref();
+        let remote_path = remote_path.as_ref();
+        info!(
+            "📤 Uploading {:?} to {:?} on VM-{}",
+            local_path, remote_path, self.id
+        );
+        let (ssh, cancel_token) = self.get_ssh()?;
+
+        // Normalize local path type
+        let meta = tokio::fs::metadata(local_path).await?;
+        if meta.is_file() {
+            // Decide final remote target path (dir vs file path)
+            let remote_target = {
+                let is_dir = {
+                    let sftp = ssh.get_sftp().await?;
+                    (sftp.read_dir(remote_path.to_string_lossy()).await).is_ok()
+                };
+                if is_dir {
+                    remote_path.join(local_path.file_name().expect("local_path has no basename"))
+                } else {
+                    remote_path.to_path_buf()
+                }
+            };
+
+            // Ensure remote parent directory exists
+            if let Some(parent) = remote_target.parent() {
+                ssh.create_dir_all(parent).await?;
+            }
+
+            // Upload single file
+            ssh.upload_file(local_path, &remote_target, cancel_token.clone())
+                .await?;
+        } else if meta.is_dir() {
+            // For directory: mirror into remote_path/<basename>
+            let base = local_path
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("local_path has no basename"))?;
+            let remote_root = remote_path.join(base);
+            ssh.create_dir_all(&remote_root).await?;
+
+            for entry in WalkDir::new(local_path).follow_links(false) {
+                let entry = entry?;
+                let ty = entry.file_type();
+
+                // Cancellation check
+                if cancel_token.is_cancelled() {
+                    bail!("Upload cancelled");
+                }
+
+                // Relative path under local_path
+                let rel = entry
+                    .path()
+                    .strip_prefix(local_path)
+                    .expect("Failed to get relative path");
+                let remote_entry = remote_root.join(rel);
+
+                if ty.is_dir() {
+                    ssh.create_dir_all(&remote_entry).await?;
+                } else if ty.is_file() {
+                    if let Some(parent) = remote_entry.parent() {
+                        ssh.create_dir_all(parent).await?;
+                    }
+                    ssh.upload_file(entry.path(), &remote_entry, cancel_token.clone())
+                        .await?;
+                } else if ty.is_symlink() {
+                    // Try to reproduce symlink if possible
+                    match tokio::fs::read_link(entry.path()).await {
+                        Ok(target) => {
+                            // Ensure parent exists
+                            if let Some(parent) = remote_entry.parent() {
+                                ssh.create_dir_all(parent).await?;
+                            }
+                            {
+                                let sftp = ssh.get_sftp().await?;
+                                let _ = sftp
+                                    .symlink(
+                                        remote_entry.to_string_lossy(),
+                                        target.to_string_lossy(),
+                                    )
+                                    .await; // best-effort
+                            }
+                        }
+                        Err(_) => {
+                            // Fallback: ignore or copy as file (we ignore silently)
+                        }
+                    }
+                }
+            }
+        } else {
+            bail!("Unsupported local path type");
+        }
+
+        Ok(())
+    }
+
+    /// Download file or directory from the machine
+    pub async fn download<P: AsRef<Path>, Q: AsRef<Path>>(
+        &mut self,
+        remote_path: P,
+        local_path: Q,
+    ) -> Result<()> {
+        let remote_path = remote_path.as_ref();
+        let local_path = local_path.as_ref();
+        info!(
+            "📥 Downloading {:?} from VM-{} to {:?}",
+            remote_path, self.id, local_path
+        );
+        let (ssh, cancel_token) = self.get_ssh()?;
+
+        // Check remote path type
+        let remote_meta = {
+            let sftp = ssh.get_sftp().await?;
+            sftp.metadata(remote_path.to_string_lossy())
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to stat remote path: {}", e))?
+        };
+
+        if !remote_meta.is_dir() {
+            // Decide final local target path (dir vs file path)
+            let local_target = match tokio::fs::metadata(local_path).await {
+                Ok(attr) if attr.is_dir() => local_path.join(
+                    remote_path
+                        .file_name()
+                        .ok_or_else(|| anyhow::anyhow!("remote_path has no basename"))?,
+                ),
+                _ => local_path.to_path_buf(),
+            };
+
+            // Ensure local parent directory exists
+            if let Some(parent) = local_target.parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    anyhow::anyhow!("Failed to create local directory {:?}: {}", parent, e)
+                })?;
+            }
+
+            // Download single file
+            ssh.download_file(remote_path, &local_target, cancel_token.clone())
+                .await?;
+        } else if remote_meta.is_dir() {
+            // For directory: mirror into local_path/<basename>
+            let base = remote_path
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("remote_path has no basename"))?;
+            let local_root = local_path.join(base);
+            tokio::fs::create_dir_all(&local_root).await.map_err(|e| {
+                anyhow::anyhow!("Failed to create local directory {:?}: {}", local_root, e)
+            })?;
+
+            // Use walk_remote_dir for DFS traversal
+            let entries = ssh
+                .walk_remote_dir(
+                    remote_path,
+                    /*follow_links=*/ false,
+                    cancel_token.clone(),
+                )
+                .await?;
+
+            for e in entries {
+                if cancel_token.is_cancelled() {
+                    return Err(anyhow::anyhow!("Download cancelled"));
+                }
+
+                // Compute local path relative to remote root
+                let rel = match e.path().strip_prefix(remote_path) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let local_entry = local_root.join(rel);
+
+                if e.file_type().is_dir() {
+                    tokio::fs::create_dir_all(&local_entry).await.map_err(|e| {
+                        anyhow::anyhow!("Failed to create local directory {:?}: {}", local_entry, e)
+                    })?;
+                } else if e.file_type().is_file() {
+                    if let Some(parent) = local_entry.parent() {
+                        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                            anyhow::anyhow!("Failed to create local directory {:?}: {}", parent, e)
+                        })?;
+                    }
+                    ssh.download_file(e.path(), &local_entry, cancel_token.clone())
+                        .await?;
+                } else if e.file_type().is_symlink() {
+                    // Best-effort: current SFTP attrs may not distinguish symlinks.
+                    // Treat as file or skip depending on future capabilities.
+                }
+            }
+        } else {
+            bail!("Unsupported remote path type");
+        }
+
+        Ok(())
+    }
+
+    /// Helper to get SSH session and cancellation token
+    fn get_ssh(&mut self) -> Result<(&mut Session, CancellationToken)> {
+        let ssh = self
+            .ssh
+            .as_mut()
+            .expect("Machine not initialized or spawned");
+        let cancel_token = self
+            .ssh_cancel_token
+            .as_ref()
+            .cloned()
+            .expect("Machine not initialized or spawned");
+        Ok((ssh, cancel_token))
+    }
+
+    /// Launch QEMU and connect SSH concurrently
     async fn launch(&mut self, is_init: bool) -> Result<()> {
         debug!(
             "SSH command for manual debugging:\nssh root@vsock/{} -i {:?}",
             self.cid, self.keypair.privkey_path,
         );
 
-        // Launch QEMU and connect SSH concurrently
         let qemu_handle = tokio::spawn(launch_qemu(
             self.qemu_should_exit.clone(),
             self.cid,
@@ -367,20 +586,238 @@ impl Machine {
                         let pid_str = tokio::fs::read_to_string(pid_file_path).await?;
                         self.pid = Some(pid_str.trim().parse()?);
                     }
-                    Ok(Err(e)) => return Err(e),
-                    Err(e) => return Err(anyhow::anyhow!("SSH task panicked: {}", e)),
+                    Ok(Err(e)) => bail!(e),
+                    Err(e) => bail!("SSH task panicked: {}", e),
                 }
             }
             result = qemu_handle => {
                 // QEMU completed or errored, cancel SSH task
                 self.ssh_cancel_token.as_ref().expect("Machine not initialized or spawned").cancel();
                 match result {
-                    Ok(Err(e)) => return Err(e),
-                    Ok(Ok(())) => return Err(anyhow::anyhow!("QEMU exited unexpectedly")),
-                    Err(e) => return Err(anyhow::anyhow!("QEMU task error: {}", e)),
+                    Ok(Err(e)) => bail!(e),
+                    Ok(Ok(())) => bail!("QEMU exited unexpectedly"),
+                    Err(e) => bail!("QEMU task error: {}", e),
                 }
             }
         }
+
+        Ok(())
+    }
+}
+
+// Filesystem methods for Machine
+impl Machine {
+    /// Copies the contents of one file to another.
+    /// This function will also copy the permission bits of the original file to the destination file.
+    pub async fn copy<P: AsRef<Path>, Q: AsRef<Path>>(&mut self, from: P, to: Q) -> Result<()> {
+        let from = from.as_ref();
+        let to = to.as_ref();
+        let (ssh, cancel_token) = self.get_ssh()?;
+
+        // Validate source and destination semantics to mirror std::fs::copy
+        {
+            let sftp = ssh.get_sftp().await?;
+            let src_meta = sftp
+                .metadata(from.to_string_lossy())
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to stat source: {e}"))?;
+            if src_meta.is_dir() {
+                bail!("Source is a directory: {:?}", from);
+            }
+
+            if let Ok(dst_meta) = sftp.metadata(to.to_string_lossy()).await
+                && dst_meta.is_dir()
+            {
+                bail!("Destination is a directory: {:?}", to);
+            }
+        }
+
+        // Use cp inside the guest to avoid round-tripping data over SFTP.
+        let cmd = format!(
+            "cp -p -- {} {}",
+            escape(from.to_string_lossy()),
+            escape(to.to_string_lossy())
+        );
+        let (code, _stdout, stderr) = ssh.call_with_output(&cmd, cancel_token).await?;
+        if code != 0 {
+            bail!(
+                "Failed to copy file (exit code {}): {}",
+                code,
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Creates a new, empty directory at the provided path
+    pub async fn create_dir<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        sftp.create_dir(path.to_string_lossy()).await?;
+
+        Ok(())
+    }
+
+    /// Recursively create a directory and all of its parent components if they are missing.
+    pub async fn create_dir_all<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        ssh.create_dir_all(path).await?;
+
+        Ok(())
+    }
+
+    /// Returns `Ok(true)` if the path points at an existing entity.
+    pub async fn exists<P: AsRef<Path>>(&mut self, path: P) -> Result<bool> {
+        let path = path.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        Ok(sftp.try_exists(path.to_string_lossy()).await?)
+    }
+
+    /// Creates a new hard link on the filesystem.
+    pub async fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(
+        &mut self,
+        original: P,
+        link: Q,
+    ) -> Result<()> {
+        let original = original.as_ref();
+        let link = link.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        sftp.hardlink(original.to_string_lossy(), link.to_string_lossy())
+            .await?;
+
+        Ok(())
+    }
+
+    /// Given a path, queries the file system to get information about a file, directory, etc.
+    pub async fn metadata<P: AsRef<Path>>(&mut self, path: P) -> Result<Metadata> {
+        let path = path.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        Ok(sftp.metadata(path.to_string_lossy()).await?)
+    }
+
+    /// Reads the entire contents of a file into a bytes vector.
+    pub async fn read<P: AsRef<Path>>(&mut self, path: P) -> Result<Vec<u8>> {
+        let path = path.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        Ok(sftp.read(path.to_string_lossy()).await?)
+    }
+
+    /// Returns an iterator over the entries within a directory.
+    pub async fn read_dir<P: AsRef<Path>>(&mut self, path: P) -> Result<ReadDir> {
+        let path = path.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        Ok(sftp.read_dir(path.to_string_lossy()).await?)
+    }
+
+    /// Reads a symbolic link, returning the file that the link points to.
+    pub async fn read_link<P: AsRef<Path>>(&mut self, path: P) -> Result<PathBuf> {
+        let path = path.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        Ok(PathBuf::from(sftp.read_link(path.to_string_lossy()).await?))
+    }
+
+    /// Reads the entire contents of a file into a string.
+    pub async fn read_to_string<P: AsRef<Path>>(&mut self, path: P) -> Result<String> {
+        let path = path.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        let bytes = sftp.read(path.to_string_lossy()).await?;
+        Ok(String::from_utf8(bytes)?)
+    }
+
+    /// Removes a directory at provided path, after removing all its contents.
+    pub async fn remove_dir_all<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        sftp.remove_dir(path.to_string_lossy()).await?;
+
+        Ok(())
+    }
+
+    /// Removes a file from the filesystem on VM.
+    pub async fn remove_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        sftp.remove_file(path.to_string_lossy()).await?;
+
+        Ok(())
+    }
+
+    /// Renames a file or directory to a new name
+    pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&mut self, from: P, to: Q) -> Result<()> {
+        let from = from.as_ref();
+        let to = to.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        sftp.rename(from.to_string_lossy(), to.to_string_lossy())
+            .await?;
+
+        Ok(())
+    }
+
+    /// Changes the permissions found on a file or a directory.
+    pub async fn set_permissions<P: AsRef<Path>>(
+        &mut self,
+        path: P,
+        perm: Permissions,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        {
+            let sftp = ssh.get_sftp().await?;
+            let mut meta = sftp
+                .metadata(path.to_string_lossy())
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to stat file: {}", e))?;
+
+            let mode = perm.mode();
+            meta.permissions = Some(mode);
+
+            sftp.set_metadata(path.to_string_lossy(), meta).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Writes a slice as the entire contents of a file.
+    ///
+    /// This function will create a file if it does not exist, and will entirely replace its contents if it does.
+    pub async fn write<P: AsRef<Path>, C: AsRef<[u8]>>(
+        &mut self,
+        path: P,
+        contents: C,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        let contents = contents.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        let _ = sftp.create(path.to_string_lossy()).await?;
+        sftp.write(path.to_string_lossy(), contents).await?;
 
         Ok(())
     }

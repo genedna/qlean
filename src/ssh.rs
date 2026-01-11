@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use russh::{
     ChannelMsg, Disconnect,
     keys::{
@@ -14,7 +14,11 @@ use russh::{
         ssh_key::{LineEnding, private::Ed25519Keypair, rand_core::OsRng},
     },
 };
-use tokio::{io::AsyncWriteExt, time::Instant};
+use russh_sftp::{client::SftpSession, protocol::OpenFlags};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    time::Instant,
+};
 use tokio_util::sync::CancellationToken;
 use tokio_vsock::{VsockAddr, VsockStream};
 use tracing::{debug, error, info};
@@ -100,6 +104,8 @@ impl russh::client::Handler for SshClient {
 /// loop
 pub struct Session {
     session: russh::client::Handle<SshClient>,
+    // Cached SFTP session for reuse; lazily initialized
+    sftp: Option<SftpSession>,
 }
 
 impl Session {
@@ -141,6 +147,7 @@ impl Session {
                         error!(
                             "Reached timeout trying to connect to virtual machine via SSH, aborting"
                         );
+                        return Err(anyhow::anyhow!("Timeout"));
                     }
                     continue;
                 }
@@ -157,7 +164,7 @@ impl Session {
                         continue;
                     }
                     e => {
-                        error!("Unhandled error occured: {e}");
+                        error!("Unhandled error occurred: {e}");
                         return Err(anyhow::anyhow!("Unknown error"));
                     }
                 },
@@ -179,7 +186,7 @@ impl Session {
                             }
                         }
                         e => {
-                            error!("Unhandled error occured: {e}");
+                            error!("Unhandled error occurred: {e}");
                             return Err(anyhow::anyhow!("Unknown error"));
                         }
                     }
@@ -193,7 +200,7 @@ impl Session {
                     }
                 }
                 Err(e) => {
-                    error!("Unhandled error occured: {e}");
+                    error!("Unhandled error occurred: {e}");
                     return Err(anyhow::anyhow!("Unknown error"));
                 }
             }
@@ -209,7 +216,27 @@ impl Session {
             return Err(anyhow::anyhow!("Authentication (with publickey) failed"));
         }
 
-        Ok(Self { session })
+        Ok(Self {
+            session,
+            sftp: None,
+        })
+    }
+
+    /// Open an SFTP session over the existing SSH connection.
+    async fn open_sftp(&mut self) -> Result<SftpSession> {
+        let channel = self.session.channel_open_session().await?;
+        channel.request_subsystem(true, "sftp").await?;
+        let sftp = SftpSession::new(channel.into_stream()).await?;
+        Ok(sftp)
+    }
+
+    /// Get a cached SFTP session, opening one if needed.
+    pub async fn get_sftp(&mut self) -> Result<&mut SftpSession> {
+        if self.sftp.is_none() {
+            let sftp = self.open_sftp().await?;
+            self.sftp = Some(sftp);
+        }
+        Ok(self.sftp.as_mut().expect("SFTP session must exist"))
     }
 
     /// Call a command via SSH, streaming its output to stdout/stderr.
@@ -355,4 +382,248 @@ pub async fn connect_ssh(
     // ssh.call("echo AcceptEnv * >> /etc/ssh/sshd_config").await?;
 
     Ok(ssh)
+}
+
+impl Session {
+    /// Recursively create a directory and all of its parent components if they are missing.
+    pub async fn create_dir_all<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        // Build path incrementally like mkdir -p
+        let mut cur = PathBuf::new();
+        for comp in path.components() {
+            cur.push(comp);
+            if cur.as_os_str().is_empty() {
+                continue;
+            }
+            // Limit SFTP borrow scope to avoid conflicts with self in recursion
+            let create_res = {
+                let sftp = self.get_sftp().await?;
+                sftp.create_dir(cur.to_string_lossy()).await
+            };
+            match create_res {
+                Ok(_) => {}
+                Err(e) => {
+                    let meta_res = {
+                        let sftp = self.get_sftp().await?;
+                        sftp.metadata(cur.to_string_lossy()).await
+                    };
+                    if let Ok(attr) = meta_res {
+                        if !attr.is_dir() {
+                            bail!("Remote path exists and is not a directory: {:?}", cur);
+                        }
+                    } else {
+                        bail!("Failed to create remote directory {:?}: {}", cur, e);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Upload a single file via SFTP.
+    pub async fn upload_file<P: AsRef<Path>, Q: AsRef<Path>>(
+        &mut self,
+        local: P,
+        remote: Q,
+        cancel_token: CancellationToken,
+    ) -> anyhow::Result<()> {
+        let local = local.as_ref();
+        let remote = remote.as_ref();
+        let mut src = tokio::fs::File::open(local).await?;
+        // Scope SFTP borrow
+        let mut dst = {
+            let sftp = self.get_sftp().await?;
+            sftp.open_with_flags(
+                remote.to_string_lossy(),
+                OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+            )
+            .await?
+        };
+
+        let mut buf = vec![0u8; 128 * 1024];
+        loop {
+            if cancel_token.is_cancelled() {
+                return Err(anyhow::anyhow!("Upload cancelled"));
+            }
+            let n = AsyncReadExt::read(&mut src, &mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            AsyncWriteExt::write_all(&mut dst, &buf[..n]).await?;
+        }
+        let _ = AsyncWriteExt::flush(&mut dst).await;
+        let _ = AsyncWriteExt::shutdown(&mut dst).await;
+        Ok(())
+    }
+
+    /// Download a single file via SFTP.
+    pub async fn download_file<P: AsRef<Path>, Q: AsRef<Path>>(
+        &mut self,
+        remote: P,
+        local: Q,
+        cancel_token: CancellationToken,
+    ) -> anyhow::Result<()> {
+        let remote = remote.as_ref();
+        let local = local.as_ref();
+        let mut src = {
+            let sftp = self.get_sftp().await?;
+            sftp.open(remote.to_string_lossy()).await?
+        };
+        let mut dst = tokio::fs::File::create(local).await?;
+
+        let mut buf = vec![0u8; 128 * 1024];
+        loop {
+            if cancel_token.is_cancelled() {
+                return Err(anyhow::anyhow!("Download cancelled"));
+            }
+            let n = AsyncReadExt::read(&mut src, &mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            AsyncWriteExt::write_all(&mut dst, &buf[..n]).await?;
+        }
+        let _ = AsyncWriteExt::flush(&mut dst).await;
+        Ok(())
+    }
+
+    /// Walk a remote directory tree over SFTP, similar to walkdir.
+    /// Returns a depth-first list of entries including the root.
+    pub async fn walk_remote_dir<P: AsRef<Path>>(
+        &mut self,
+        root: P,
+        follow_links: bool,
+        cancel_token: CancellationToken,
+    ) -> Result<Vec<RemoteDirEntry>> {
+        let root = root.as_ref();
+        let mut out = Vec::new();
+
+        // Stat root
+        let root_meta = {
+            let sftp = self.get_sftp().await?;
+            sftp.metadata(root.to_string_lossy()).await?
+        };
+        let root_type = RemoteFileType::from_attrs(&root_meta);
+        out.push(RemoteDirEntry::new(root.to_path_buf(), root_type));
+
+        // If root is not a dir, nothing more to traverse
+        if !out[0].file_type.is_dir() {
+            return Ok(out);
+        }
+
+        // DFS stack of directories to visit
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            if cancel_token.is_cancelled() {
+                return Err(anyhow::anyhow!("Walk cancelled"));
+            }
+
+            let entries = {
+                let sftp = self.get_sftp().await?;
+                match sftp.read_dir(dir.to_string_lossy()).await {
+                    Ok(e) => e,
+                    Err(e) => {
+                        // If directory can't be read, skip (best-effort)
+                        debug!("Failed to read_dir {:?}: {}", dir, e);
+                        continue;
+                    }
+                }
+            };
+
+            for entry in entries {
+                let name = entry.file_name();
+                if name == "." || name == ".." {
+                    continue;
+                }
+
+                let child_path = dir.join(&name);
+                let attrs = {
+                    let sftp = self.get_sftp().await?;
+                    match sftp.metadata(child_path.to_string_lossy()).await {
+                        Ok(a) => a,
+                        Err(e) => {
+                            debug!("Failed to stat {:?}: {}", child_path, e);
+                            continue;
+                        }
+                    }
+                };
+                let ftype = RemoteFileType::from_attrs(&attrs);
+                out.push(RemoteDirEntry::new(child_path.clone(), ftype.clone()));
+
+                if ftype.is_dir() {
+                    stack.push(child_path);
+                } else if ftype.is_symlink() && follow_links {
+                    // If it's a symlink and we're following links, stat the target
+                    let target_path = {
+                        let sftp = self.get_sftp().await?;
+                        match sftp.read_link(child_path.to_string_lossy()).await {
+                            Ok(tp) => PathBuf::from(tp),
+                            Err(e) => {
+                                bail!("Failed to read_link {:?}: {}", child_path, e);
+                            }
+                        }
+                    };
+                    let target_attrs = {
+                        let sftp = self.get_sftp().await?;
+                        match sftp.metadata(target_path.to_string_lossy()).await {
+                            Ok(a) => a,
+                            Err(e) => {
+                                bail!("Failed to stat symlink target {:?}: {}", target_path, e);
+                            }
+                        }
+                    };
+                    let target_type = RemoteFileType::from_attrs(&target_attrs);
+                    if target_type.is_dir() {
+                        stack.push(target_path);
+                    }
+                }
+            }
+        }
+
+        Ok(out)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteFileType {
+    is_dir: bool,
+    is_file: bool,
+    is_symlink: bool,
+}
+
+impl RemoteFileType {
+    fn from_attrs(attrs: &russh_sftp::protocol::FileAttributes) -> Self {
+        Self {
+            is_dir: attrs.is_dir(),
+            is_file: attrs.file_type().is_file(),
+            is_symlink: attrs.file_type().is_symlink(),
+        }
+    }
+    pub fn is_dir(&self) -> bool {
+        self.is_dir
+    }
+    pub fn is_file(&self) -> bool {
+        self.is_file
+    }
+    pub fn is_symlink(&self) -> bool {
+        self.is_symlink
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteDirEntry {
+    path: PathBuf,
+    file_type: RemoteFileType,
+}
+
+impl RemoteDirEntry {
+    fn new(path: PathBuf, file_type: RemoteFileType) -> Self {
+        Self { path, file_type }
+    }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn file_type(&self) -> &RemoteFileType {
+        &self.file_type
+    }
 }
